@@ -1,0 +1,206 @@
+name: helicone-production
+
+services:
+  # =============================================================================
+  # INFRASTRUCTURE (INTERNAL ONLY)
+  # =============================================================================
+
+  db:
+    image: postgres:17.4
+    container_name: helicone-postgres
+    environment:
+      POSTGRES_DB: helicone_test
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    # ❌ No public port mapping to host
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3.13.40
+    container_name: helicone-clickhouse
+    # ❌ No public port mapping
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    environment:
+      CLICKHOUSE_DEFAULT_USER: default
+    restart: always
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  minio:
+    image: minio/minio
+    container_name: helicone-minio
+    # ❌ No public port mapping
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  minio-setup:
+    image: minio/mc:RELEASE.2025-04-08T15-39-49Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set localminio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      /usr/bin/mc mb --ignore-existing localminio/request-response-storage;
+      exit 0;
+      "
+
+  mailhog:
+    image: mailhog/mailhog
+    container_name: mailhog
+    # ❌ No public mapping — if you need UI, bind to localhost only
+    restart: always
+
+  redis:
+    image: redis:8.0.2-alpine
+    container_name: helicone-redis
+    restart: always
+    # ❌ No public port mapping
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  migrations:
+    build:
+      context: ../
+      dockerfile: docker/dockerfiles/dockerfile_migrations
+    depends_on:
+      db:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      FLYWAY_URL: jdbc:postgresql://db:5432/helicone_test
+      FLYWAY_USER: postgres
+      FLYWAY_PASSWORD: ${POSTGRES_PASSWORD}
+      CLICKHOUSE_HOST: http://clickhouse:8123
+      CLICKHOUSE_USER: default
+    volumes:
+      - ../supabase:/app/supabase
+      - ../clickhouse:/app/clickhouse
+
+  # =============================================================================
+  # APPLICATION SERVICES (PUBLIC THROUGH DOKPLOY)
+  # =============================================================================
+
+  jawn:
+    container_name: helicone-jawn
+    build:
+      context: ../
+      dockerfile: valhalla/dockerfile
+    restart: always
+    expose:
+      - "${JAWN_PORT}" # Internal Docker port exposure only
+    depends_on:
+      db:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrations:
+        condition: service_completed_successfully
+    environment:
+      PORT: ${JAWN_PORT}
+      NODE_ENV: production
+      NEXT_PUBLIC_BETTER_AUTH: "true"
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+      DATABASE_URL: ${DATABASE_URL}
+      SUPABASE_DATABASE_URL: ${SUPABASE_DATABASE_URL}
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET_NAME: request-response-storage
+      S3_ENDPOINT_PUBLIC: ${S3_ENDPOINT_PUBLIC}
+      CLICKHOUSE_HOST: http://clickhouse:8123
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_CREDS: |
+        {
+          "CLICKHOUSE_HOST": "http://clickhouse:8123",
+          "CLICKHOUSE_USER": "default",
+          "CLICKHOUSE_PASSWORD": "",
+          "CLICKHOUSE_HQL_USER": "hql_user",
+          "CLICKHOUSE_HQL_PASSWORD": ""
+        }
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      VERCEL_ENV: production
+
+  web:
+    container_name: helicone-web
+    build:
+      context: ../
+      dockerfile: docker/dockerfiles/dockerfile_web
+      args:
+        NEXT_PUBLIC_HELICONE_JAWN_SERVICE: ${NEXT_PUBLIC_HELICONE_JAWN_SERVICE}
+        NEXT_PUBLIC_BETTER_AUTH: "true"
+        NODE_ENV: production
+    expose:
+      - "3000"
+    depends_on:
+      - jawn
+      - db
+    restart: always
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_BETTER_AUTH: "true"
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+      NEXT_PUBLIC_HELICONE_JAWN_SERVICE: ${NEXT_PUBLIC_HELICONE_JAWN_SERVICE}
+      DATABASE_URL: ${DATABASE_URL}
+      CLICKHOUSE_HOST: http://clickhouse:8123
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      VERCEL_ENV: production
+
+volumes:
+  postgres_data:
+    driver: local
+  minio_data:
+    driver: local
+  clickhouse_data:
+    driver: local
+
+networks:
+  default:
+    driver: bridge
